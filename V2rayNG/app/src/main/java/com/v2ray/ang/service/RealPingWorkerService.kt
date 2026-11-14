@@ -12,20 +12,22 @@ import com.v2ray.ang.handler.SettingsManager
 import com.v2ray.ang.handler.SpeedtestManager
 import com.v2ray.ang.util.JsonUtil
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.CoroutineContext
 
 internal object RealPingExecutionLimiter {
     private val serializedMutex = Mutex()
@@ -53,6 +55,56 @@ internal object RealPingExecutionLimiter {
             elem.isJsonObject && elem.asJsonObject.get("protocol")
                 ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
                 ?.asString.equals("wireguard", ignoreCase = true)
+        }
+    }
+}
+
+internal object RealPingStageRunner {
+    /**
+     * Run [probes] with at most [maxParallel] at once and return the first non-negative delay,
+     * or null when every probe fails.
+     *
+     * Once one probe succeeds, probes that have not started are cancelled. A native probe that
+     * is already running cannot be interrupted; it finishes in the background under [parent]
+     * and its result is ignored. A throwing probe counts as a failed probe.
+     */
+    suspend fun firstSuccess(
+        parent: Job,
+        context: CoroutineContext,
+        probes: List<suspend () -> Long>,
+        maxParallel: Int
+    ): Long? {
+        if (probes.isEmpty()) return null
+        val result = CompletableDeferred<Long?>()
+        val remaining = AtomicInteger(probes.size)
+        val permits = Semaphore(maxParallel)
+        val stageJob = SupervisorJob(parent)
+        val stageScope = CoroutineScope(stageJob + context)
+        probes.forEach { probe ->
+            stageScope.launch {
+                try {
+                    val delay = try {
+                        permits.withPermit { probe() }
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (_: Throwable) {
+                        // A probe failure must not escape to the uncaught-exception handler.
+                        -1L
+                    }
+                    if (delay >= 0) {
+                        result.complete(delay)
+                    }
+                } finally {
+                    if (remaining.decrementAndGet() == 0) {
+                        result.complete(null)
+                    }
+                }
+            }
+        }
+        return try {
+            result.await()
+        } finally {
+            stageJob.cancel()
         }
     }
 }
@@ -145,22 +197,23 @@ class RealPingWorkerService(
         val stages = CoreConfigManager.getV2rayConfigStages4Speedtest(context, guid) ?: return retFailure
         val testUrl = SettingsManager.getDelayTestUrl()
         for (stage in stages) {
-            // Probes of one stage run in parallel on this worker's dispatcher, so the native
-            // probe count stays bounded by the configured concurrency.
-            val best = coroutineScope {
-                stage.map { content ->
-                    async {
-                        RealPingExecutionLimiter.run(config.configType, content) {
-                            CoreNativeManager.measureOutboundDelay(content, testUrl)
-                        }
-                    }
-                }.awaitAll()
-            }.filter { it >= 0 }.minOrNull()
-            if (best != null) {
-                return best
+            val delay = probeStage(stage, config.configType, testUrl)
+            if (delay != null) {
+                return delay
             }
         }
         return retFailure
+    }
+
+    private suspend fun probeStage(stage: List<String>, configType: EConfigType, testUrl: String): Long? {
+        val probes = stage.map { content ->
+            suspend {
+                RealPingExecutionLimiter.run(configType, content) {
+                    CoreNativeManager.measureOutboundDelay(content, testUrl)
+                }
+            }
+        }
+        return RealPingStageRunner.firstSuccess(job, dispatcher, probes, MAX_PARALLEL_PROBES_PER_PROFILE)
     }
 
     private fun startTcping(guid: String): Long {
@@ -182,5 +235,9 @@ class RealPingWorkerService(
         }
 
         return retFailure
+    }
+
+    private companion object {
+        const val MAX_PARALLEL_PROBES_PER_PROFILE = 4
     }
 }
