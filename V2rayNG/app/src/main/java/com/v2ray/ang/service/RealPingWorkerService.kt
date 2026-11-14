@@ -16,6 +16,9 @@ import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
@@ -139,13 +142,25 @@ class RealPingWorkerService(
             }
         }
 
-        val configResult = CoreConfigManager.getV2rayConfig4Speedtest(context, guid)
-        if (!configResult.status) {
-            return retFailure
+        val stages = CoreConfigManager.getV2rayConfigStages4Speedtest(context, guid) ?: return retFailure
+        val testUrl = SettingsManager.getDelayTestUrl()
+        for (stage in stages) {
+            // Probes of one stage run in parallel on this worker's dispatcher, so the native
+            // probe count stays bounded by the configured concurrency.
+            val best = coroutineScope {
+                stage.map { content ->
+                    async {
+                        RealPingExecutionLimiter.run(config.configType, content) {
+                            CoreNativeManager.measureOutboundDelay(content, testUrl)
+                        }
+                    }
+                }.awaitAll()
+            }.filter { it >= 0 }.minOrNull()
+            if (best != null) {
+                return best
+            }
         }
-        return RealPingExecutionLimiter.run(config.configType, configResult.content) {
-            CoreNativeManager.measureOutboundDelay(configResult.content, SettingsManager.getDelayTestUrl())
-        }
+        return retFailure
     }
 
     private fun startTcping(guid: String): Long {

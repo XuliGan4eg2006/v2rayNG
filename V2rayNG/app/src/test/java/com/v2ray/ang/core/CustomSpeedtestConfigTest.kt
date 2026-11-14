@@ -45,4 +45,98 @@ class CustomSpeedtestConfigTest {
         assertNull(CoreConfigManager.trimCustomConfigForSpeedtest("""{"inbounds": []}""", "warning"))
         assertNull(CoreConfigManager.trimCustomConfigForSpeedtest("""{"outbounds": []}""", "warning"))
     }
+
+    @Test
+    fun plainConfigProbesFirstOutboundOnly() {
+        val raw = """
+            {
+              "inbounds": [{"tag": "socks", "protocol": "socks"}],
+              "routing": {"rules": [{"type": "field", "domain": ["example.org"], "outboundTag": "direct"}]},
+              "outbounds": [{"tag": "proxy", "protocol": "vless"}, {"tag": "direct", "protocol": "freedom"}]
+            }
+        """.trimIndent()
+
+        assertEquals(listOf(listOf("proxy")), firstTags(raw))
+    }
+
+    @Test
+    fun defaultRuleSelectsNonFirstOutbound() {
+        val raw = """
+            {
+              "inbounds": [{"tag": "socks", "protocol": "socks"}],
+              "routing": {"rules": [{"type": "field", "network": "tcp,udp", "outboundTag": "main"}]},
+              "outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "main", "protocol": "vless"}]
+            }
+        """.trimIndent()
+
+        assertEquals(listOf(listOf("main")), firstTags(raw))
+    }
+
+    @Test
+    fun balancerChainThroughLoopbacksBecomesOrderedStages() {
+        val raw = """
+            {
+              "inbounds": [{"tag": "socks", "protocol": "socks"}, {"tag": "http", "protocol": "http"}],
+              "routing": {
+                "rules": [
+                  {"type": "field", "inboundTag": ["socks", "http"], "balancerTag": "CHEAP-ONLY"},
+                  {"type": "field", "inboundTag": ["REROUTE-HIGH"], "balancerTag": "HIGH-ONLY"},
+                  {"type": "field", "domain": ["example.org"], "outboundTag": "direct"}
+                ],
+                "balancers": [
+                  {"tag": "CHEAP-ONLY", "selector": ["cheap"], "strategy": {"type": "leastPing"}, "fallbackTag": "LOOP-TO-HIGH"},
+                  {"tag": "HIGH-ONLY", "selector": ["high"], "strategy": {"type": "leastLoad"}, "fallbackTag": "direct"}
+                ]
+              },
+              "outbounds": [
+                {"tag": "cheap", "protocol": "vless"},
+                {"tag": "cheap-2", "protocol": "vless", "mux": {"enabled": true}},
+                {"tag": "high", "protocol": "vless"},
+                {"tag": "high-2", "protocol": "vless"},
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "block", "protocol": "blackhole"},
+                {"tag": "LOOP-TO-HIGH", "protocol": "loopback", "settings": {"inboundTag": "REROUTE-HIGH"}}
+              ]
+            }
+        """.trimIndent()
+
+        // The direct fallback is not probed, so an unreachable chain reports failure.
+        assertEquals(
+            listOf(listOf("cheap", "cheap-2"), listOf("high", "high-2")),
+            firstTags(raw)
+        )
+        val probe = JsonParser.parseString(CoreConfigManager.planCustomSpeedtest(raw, "warning")!![0][1]).asJsonObject
+        val outbounds = probe.getAsJsonArray("outbounds")
+        assertEquals(7, outbounds.size())
+        assertFalse(outbounds[0].asJsonObject.has("mux"))
+    }
+
+    @Test
+    fun balancerFallbackCycleTerminates() {
+        val raw = """
+            {
+              "inbounds": [{"tag": "socks", "protocol": "socks"}],
+              "routing": {
+                "rules": [
+                  {"type": "field", "inboundTag": ["socks", "again"], "balancerTag": "B"}
+                ],
+                "balancers": [{"tag": "B", "selector": ["p"], "fallbackTag": "loop"}]
+              },
+              "outbounds": [
+                {"tag": "p1", "protocol": "vless"},
+                {"tag": "loop", "protocol": "loopback", "settings": {"inboundTag": "again"}}
+              ]
+            }
+        """.trimIndent()
+
+        assertEquals(listOf(listOf("p1")), firstTags(raw))
+    }
+
+    private fun firstTags(raw: String): List<List<String>> =
+        CoreConfigManager.planCustomSpeedtest(raw, "warning")!!.map { stage ->
+            stage.map { config ->
+                JsonParser.parseString(config).asJsonObject.getAsJsonArray("outbounds")[0]
+                    .asJsonObject.get("tag").asString
+            }
+        }
 }

@@ -3,6 +3,7 @@ package com.v2ray.ang.core
 import android.content.Context
 import android.text.TextUtils
 import com.google.gson.JsonArray
+import com.google.gson.JsonElement
 import com.google.gson.JsonObject
 import com.v2ray.ang.AppConfig
 import com.v2ray.ang.dto.ConfigResult
@@ -120,10 +121,67 @@ object CoreConfigManager {
         val outbounds = source.get("outbounds")?.takeIf { it.isJsonArray }?.asJsonArray
             ?.takeIf { it.size() > 0 }
             ?: return null
+        return buildCustomProbeConfig(outbounds, 0, logLevel)
+    }
 
+    /**
+     * Build delay-test probe configs, grouped into stages, for every profile type.
+     *
+     * Stages are tried in order and a stage succeeds with its lowest delay when any probe in
+     * it succeeds. Generated profiles always produce one stage with one config; custom
+     * profiles follow their default route (see [planCustomSpeedtest]).
+     *
+     * @return the stages, or null when no probe config can be built.
+     */
+    fun getV2rayConfigStages4Speedtest(context: Context, guid: String): List<List<String>>? {
+        val profile = MmkvManager.decodeServerConfig(guid) ?: return null
+        if (profile.configType == EConfigType.CUSTOM) {
+            val raw = MmkvManager.decodeServerRaw(guid) ?: return null
+            val logLevel = MmkvManager.decodeSettingsString(AppConfig.PREF_LOGLEVEL) ?: "warning"
+            return planCustomSpeedtest(raw, logLevel)
+        }
+        val configResult = getV2rayConfig4Speedtest(context, guid)
+        return if (configResult.status) listOf(listOf(configResult.content)) else null
+    }
+
+    /**
+     * Plan delay probes for a custom config along the route its traffic takes by default.
+     *
+     * The native probe ignores routing and always dials the first outbound, which is wrong
+     * for configs whose default rule targets another outbound or a balancer ("Auto" entries
+     * in panel JSON subscriptions). Starting from the config's inbound tags, the first rule
+     * without domain/IP/port/protocol/source conditions is followed:
+     * - an outbound tag yields a stage with that outbound;
+     * - a loopback outbound re-enters routing with its `settings.inboundTag`;
+     * - a balancer yields a stage with every selector-matched (tag prefix) proxy outbound,
+     *   then its `fallbackTag` is followed into the next stages.
+     * Direct, block, DNS, and loopback outbounds are never probed inside a balancer path, so
+     * a fully unreachable balancer reports failure instead of a direct-connection delay.
+     * With no matching rule, the first outbound is probed, matching Xray's default.
+     *
+     * @return probe configs grouped into stages, or null when [raw] has no outbounds.
+     */
+    internal fun planCustomSpeedtest(raw: String, logLevel: String): List<List<String>>? {
+        val source = JsonUtil.parseString(raw) ?: return null
+        val outbounds = source.get("outbounds")?.takeIf { it.isJsonArray }?.asJsonArray
+            ?.takeIf { it.size() > 0 }
+            ?: return null
+        val stages = CustomRoutePlanner(source, outbounds).plan()
+        return stages.map { stage -> stage.mapNotNull { buildCustomProbeConfig(outbounds, it, logLevel) } }
+            .filter { it.isNotEmpty() }
+            .takeIf { it.isNotEmpty() }
+    }
+
+    /**
+     * Probe config with `log` and all `outbounds` (mux removed), moving [firstIndex] to the
+     * front because the native probe dials the first outbound. Other outbounds stay so that
+     * `dialerProxy`/`proxySettings` chains still resolve.
+     */
+    private fun buildCustomProbeConfig(outbounds: JsonArray, firstIndex: Int, logLevel: String): String? {
+        val order = listOf(firstIndex) + outbounds.indices().filter { it != firstIndex }
         val trimmedOutbounds = JsonArray()
-        for (elem in outbounds) {
-            val outbound = elem.deepCopy()
+        for (index in order) {
+            val outbound = outbounds[index].deepCopy()
             if (outbound.isJsonObject) {
                 outbound.asJsonObject.remove("mux")
             }
@@ -134,6 +192,104 @@ object CoreConfigManager {
         trimmed.add("log", JsonObject().apply { addProperty("loglevel", logLevel) })
         trimmed.add("outbounds", trimmedOutbounds)
         return JsonUtil.toJsonPretty(trimmed)
+    }
+
+    private fun JsonArray.indices(): IntRange = 0 until size()
+
+    /** Resolves a custom config's default route into stages of outbound indices. */
+    private class CustomRoutePlanner(source: JsonObject, private val outbounds: JsonArray) {
+        private val routing = source.get("routing")?.takeIf { it.isJsonObject }?.asJsonObject
+        private val rules = routing?.get("rules")?.takeIf { it.isJsonArray }?.asJsonArray
+            ?.mapNotNull { it.takeIf { it.isJsonObject }?.asJsonObject }
+            .orEmpty()
+        private val balancers = routing?.get("balancers")?.takeIf { it.isJsonArray }?.asJsonArray
+            ?.mapNotNull { it.takeIf { it.isJsonObject }?.asJsonObject }
+            ?.mapNotNull { balancer -> balancer.stringOrNull("tag")?.let { it to balancer } }
+            ?.toMap()
+            .orEmpty()
+        private val entryInboundTags = source.get("inbounds")?.takeIf { it.isJsonArray }?.asJsonArray
+            ?.mapNotNull { it.takeIf { it.isJsonObject }?.asJsonObject?.stringOrNull("tag") }
+            .orEmpty()
+        private val stages = mutableListOf<List<Int>>()
+        private val visited = mutableSetOf<String>()
+
+        fun plan(): List<List<Int>> {
+            followInbound(entryInboundTags, 0)
+            if (stages.isEmpty()) {
+                stages.add(listOf(0))
+            }
+            return stages
+        }
+
+        private fun followInbound(inboundTags: List<String>, depth: Int) {
+            if (depth > MAX_DEPTH) return
+            val rule = rules.firstOrNull { matchesDefaultTraffic(it, inboundTags) } ?: return
+            rule.stringOrNull("balancerTag")?.let { return followBalancer(it, depth + 1) }
+            rule.stringOrNull("outboundTag")?.let { followOutbound(it, depth + 1, inBalancerPath = false) }
+        }
+
+        private fun followOutbound(tag: String, depth: Int, inBalancerPath: Boolean) {
+            if (depth > MAX_DEPTH || !visited.add("outbound:$tag")) return
+            val index = indexOfTag(tag) ?: return
+            val outbound = outbounds[index].asJsonObject
+            val protocol = outbound.stringOrNull("protocol")
+            if (protocol == "loopback") {
+                val inboundTag = outbound.get("settings")?.takeIf { it.isJsonObject }?.asJsonObject
+                    ?.stringOrNull("inboundTag") ?: return
+                followInbound(listOf(inboundTag), depth + 1)
+            } else if (!inBalancerPath || protocol !in NON_PROXY_PROTOCOLS) {
+                stages.add(listOf(index))
+            }
+        }
+
+        private fun followBalancer(tag: String, depth: Int) {
+            if (depth > MAX_DEPTH || !visited.add("balancer:$tag")) return
+            val balancer = balancers[tag] ?: return
+            val selectors = balancer.get("selector")?.takeIf { it.isJsonArray }?.asJsonArray
+                ?.mapNotNull { it.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString }
+                .orEmpty()
+            val members = outbounds.indices().filter { index ->
+                val outbound = outbounds[index].takeIf { it.isJsonObject }?.asJsonObject ?: return@filter false
+                val outboundTag = outbound.stringOrNull("tag") ?: return@filter false
+                outbound.stringOrNull("protocol") !in NON_MEMBER_PROTOCOLS &&
+                    selectors.any { outboundTag.startsWith(it) }
+            }
+            if (members.isNotEmpty()) {
+                stages.add(members)
+            }
+            balancer.stringOrNull("fallbackTag")?.let { followOutbound(it, depth + 1, inBalancerPath = true) }
+        }
+
+        private fun matchesDefaultTraffic(rule: JsonObject, inboundTags: List<String>): Boolean {
+            if (rule.keySet().any { it !in DEFAULT_ROUTE_RULE_KEYS }) return false
+            if (!rule.has("outboundTag") && !rule.has("balancerTag")) return false
+            val network = rule.get("network")
+            if (network != null && !network.stringValues().flatMap { it.split(',') }.any { it.trim() == "tcp" }) {
+                return false
+            }
+            val ruleInbounds = rule.get("inboundTag") ?: return true
+            return ruleInbounds.stringValues().any { it in inboundTags }
+        }
+
+        private fun indexOfTag(tag: String): Int? = outbounds.indices().firstOrNull { index ->
+            outbounds[index].takeIf { it.isJsonObject }?.asJsonObject?.stringOrNull("tag") == tag
+        }
+
+        private fun JsonObject.stringOrNull(key: String): String? =
+            get(key)?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }?.asString
+
+        private fun JsonElement.stringValues(): List<String> = when {
+            isJsonArray -> asJsonArray.mapNotNull { it.takeIf { it.isJsonPrimitive }?.asString }
+            isJsonPrimitive -> listOf(asString)
+            else -> emptyList()
+        }
+
+        private companion object {
+            const val MAX_DEPTH = 16
+            val DEFAULT_ROUTE_RULE_KEYS = setOf("type", "ruleTag", "inboundTag", "network", "outboundTag", "balancerTag")
+            val NON_PROXY_PROTOCOLS = setOf("freedom", "blackhole", "dns")
+            val NON_MEMBER_PROTOCOLS = NON_PROXY_PROTOCOLS + "loopback"
+        }
     }
 
     /**
